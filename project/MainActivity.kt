@@ -1,0 +1,91 @@
+package com.example.project
+
+import android.os.Bundle
+import android.view.View
+import androidx.activity.enableEdgeToEdge
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.Observer
+import androidx.lifecycle.ViewModelProvider
+import androidx.recyclerview.widget.RecyclerView
+import androidx.viewpager2.widget.CompositePageTransformer
+import androidx.viewpager2.widget.MarginPageTransformer
+import androidx.viewpager2.widget.ViewPager2
+import com.example.project.databinding.ActivityMainBinding
+
+
+class MainActivity : AppCompatActivity() {
+
+    private val viewModel: MainViewModel by lazy{
+        ViewModelProvider(this).get(MainViewModel::class.java)
+    }
+
+    private lateinit var binding: ActivityMainBinding
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        initBanner()
+
+    }
+
+    private fun initBanner() {
+        binding.progressBar.visibility = View.VISIBLE
+        viewModel.banner.observe(this, Observer{
+            binding.progressBar.visibility = View.GONE
+            banners(it)
+        })
+        viewModel.loadBanners()
+        styleBanner(binding.viewPager2)
+    }
+
+    private fun banners(image: List<SliderModel>){
+        binding.apply {
+            viewPager2.adapter = SliderAdapter(image, viewPager2)
+            viewPager2.clipToPadding = false
+            viewPager2.clipChildren = false
+            viewPager2.offscreenPageLimit = 1
+            viewPager2.getChildAt(0).overScrollMode = View.OVER_SCROLL_NEVER
+
+            if(image.size > 1){
+                dotIndicator.visibility = View.VISIBLE
+                dotIndicator.attachTo(viewPager2)
+            }
+        }
+    }
+
+    private fun styleBanner(viewPager: ViewPager2){
+        viewPager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback(){
+            override fun onPageSelected(position: Int) {
+                super.onPageSelected(position)
+
+                viewPager.post{
+                    val recyclerView = viewPager.getChildAt(0) as? RecyclerView
+                    val layoutManager = recyclerView?.layoutManager
+                    val currentView = layoutManager?.findViewByPosition(position)
+
+                    currentView?.let { view ->
+                        val imageView = view.findViewById<View>(R.id.imageSlide)
+
+                        imageView.post{
+                            val widthMeasureSpec = View.MeasureSpec.makeMeasureSpec(viewPager.width, View.MeasureSpec.EXACTLY)
+                            val heightMeasureSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+
+                            imageView.measure(widthMeasureSpec, heightMeasureSpec)
+
+                            val targetHeight = imageView.measuredHeight
+
+                            if(viewPager.layoutParams.height != targetHeight && targetHeight > 0){
+                                viewPager.layoutParams.height = targetHeight
+                                viewPager.requestLayout()
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
