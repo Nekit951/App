@@ -1,0 +1,330 @@
+package com.example.maps
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
+import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.Toast
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.example.maps.databinding.ActivityMainBinding
+import com.google.firebase.database.FirebaseDatabase
+import com.yandex.mapkit.Animation
+import com.yandex.mapkit.MapKitFactory
+import com.yandex.mapkit.geometry.BoundingBox
+import com.yandex.mapkit.geometry.Point
+import com.yandex.mapkit.map.CameraPosition
+import com.yandex.mapkit.map.InputListener
+import com.yandex.mapkit.map.Map
+import com.yandex.mapkit.mapview.MapView
+import com.yandex.mapkit.search.Response
+import com.yandex.mapkit.search.SearchFactory
+import com.yandex.mapkit.search.SearchManager
+import com.yandex.mapkit.search.SearchManagerType
+import com.yandex.mapkit.search.SearchOptions
+import com.yandex.mapkit.search.SearchType
+import com.yandex.mapkit.search.Session
+import com.yandex.mapkit.search.SuggestOptions
+import com.yandex.mapkit.search.SuggestResponse
+import com.yandex.mapkit.search.SuggestSession
+import com.yandex.mapkit.search.SuggestType
+import com.yandex.runtime.Error
+import java.lang.ref.WeakReference
+
+
+class MainActivity() : AppCompatActivity() {
+
+    private lateinit var binding: ActivityMainBinding
+    private lateinit var mapView: MapView
+    private lateinit var searchManager: SearchManager
+    private var searchSession: Session? = null
+    private var selectionPlacemark: com.yandex.mapkit.map.PlacemarkMapObject? = null
+    private var mapInputListenerRef: WeakReference<InputListener>? = null
+    private var suggestSession: SuggestSession? = null
+    private lateinit var suggestAdapter: SuggestAdapter
+    private val suggestOptions = SuggestOptions().setSuggestTypes(SuggestType.GEO.value)
+
+
+    private val searchListener = object : Session.SearchListener {
+        override fun onSearchResponse(response: Response) {
+            val searchResult = response.collection.children.firstOrNull()
+
+            if (searchResult != null) {
+                val metadata = searchResult.obj?.metadataContainer?.getItem(
+                    com.yandex.mapkit.search.ToponymObjectMetadata::class.java
+                )
+
+                val address = metadata?.address?.formattedAddress
+                val point = searchResult.obj?.geometry?.firstOrNull()?.point
+
+                if (!address.isNullOrEmpty()) {
+                    binding.mapText.setText(address)
+                } else {
+                    binding.mapText.setText("Адрес не найден")
+                }
+
+                if (point != null) {
+                    drawMarkerAtPoint(point)
+                    mapView.mapWindow.map.move(
+                        CameraPosition(point, 16f, 0f, 0f),
+                        Animation(Animation.Type.SMOOTH, 1f),
+                        null
+                    )
+                }
+
+            } else {
+                binding.mapText.setText("Адрес не определен")
+            }
+        }
+
+        override fun onSearchError(error: Error) {
+
+        }
+    }
+
+    private val suggestListener = object : SuggestSession.SuggestListener {
+        override fun onResponse(response: SuggestResponse) {
+            // Берем только текстовые названия адресов
+            val suggestions = response.items.map { it.title.text }
+            suggestAdapter.updateItems(suggestions)
+
+            if (suggestions.isNotEmpty()) {
+                binding.mapText.showDropDown()
+            }
+        }
+
+        override fun onError(error: com.yandex.runtime.Error) {
+            // Ошибки подсказок можно не показывать пользователю, чтобы не спамить тостами
+        }
+    }
+
+    private val mapInputListener = object : InputListener {
+        override fun onMapLongTap(
+            map: Map,
+            point: Point
+        ) {
+            binding.mapText.setText("Загрузка адреса...")
+
+            // Используем оптимизированный метод рисования точки
+            drawMarkerAtPoint(point)
+
+            // Отправляем запрос геокодеру
+            val searchOptions = SearchOptions().apply {
+                searchTypes = SearchType.GEO.value
+                resultPageSize = 1
+                geometry = true
+            }
+            searchSession?.cancel() // Отменяем старый запрос, если он выполнялся
+            searchSession = searchManager.submit(point, 16, searchOptions, searchListener)
+        }
+
+        override fun onMapTap(map: Map, point: Point) {
+
+        }
+    }
+
+    private val locationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val fineLocationGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] ?: false
+        val coarseLocationGranted = permissions[Manifest.permission.ACCESS_COARSE_LOCATION] ?: false
+        if (fineLocationGranted || coarseLocationGranted) {
+            activateUserLocation()
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Разметка экрана создается сразу
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        mapView = binding.mapview
+
+
+        // Запускаем проверку разрешений геолокации
+        checkLocationPermissions()
+        initMap()
+        setupSuggest()
+        buttonAdd()
+    }
+
+    private fun setupSuggest() {
+        suggestAdapter = SuggestAdapter(this, android.R.layout.simple_dropdown_item_1line)
+        binding.mapText.setAdapter(suggestAdapter)
+
+        // ИСПРАВЛЕНО: Создаем сессию саджеста через существующий searchManager
+        suggestSession = searchManager.createSuggestSession()
+
+        binding.mapText.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+
+            override fun afterTextChanged(s: Editable?) {
+                val query = s.toString().trim()
+                if (query.length >= 2 && query != "Загрузка адреса..." && query != "Адрес не найден" && query != "Адрес не определен") {
+                    // Получаем текущие координаты видимой области карты для релевантности подсказок
+                    val visibleRegion = mapView.mapWindow.map.visibleRegion
+                    val boundingBox = BoundingBox(visibleRegion.bottomLeft, visibleRegion.topRight)
+
+                    // ИСПРАВЛЕНО: Метод вызова подсказок у сессии — suggest
+                    suggestSession?.suggest(query, boundingBox, suggestOptions, suggestListener)
+                }
+            }
+        })
+
+        binding.mapText.onItemClickListener = AdapterView.OnItemClickListener { _, _, position, _ ->
+            val selectedAddress = suggestAdapter.getItem(position)
+            if (!selectedAddress.isNullOrEmpty()) {
+                binding.mapText.setText(selectedAddress)
+
+                val visibleRegion = mapView.mapWindow.map.visibleRegion
+                val boundingBox = BoundingBox(visibleRegion.bottomLeft, visibleRegion.topRight)
+
+                val searchOptions = SearchOptions().apply {
+                    searchTypes = SearchType.GEO.value
+                    resultPageSize = 1
+                }
+
+                // ИСПРАВЛЕНО: Передаем Geometry.fromBoundingBox для текстового поиска геокодером
+                searchSession?.cancel()
+                searchSession = searchManager.submit(
+                    selectedAddress,
+                    com.yandex.mapkit.geometry.Geometry.fromBoundingBox(boundingBox),
+                    searchOptions,
+                    searchListener
+                )
+            }
+        }
+    }
+
+    private fun checkLocationPermissions() {
+        val fineLocationCheck = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+        val coarseLocationCheck = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION)
+
+        if (fineLocationCheck == PackageManager.PERMISSION_GRANTED || coarseLocationCheck == PackageManager.PERMISSION_GRANTED) {
+            activateUserLocation()
+        } else {
+            // Если разрешений нет — запрашиваем их
+            locationPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
+        }
+    }
+
+    private fun initMap(){
+        searchManager = SearchFactory.getInstance().createSearchManager(SearchManagerType.ONLINE)
+
+        // ПРАВИЛЬНОЕ сохранение слушателя в WeakReference
+        val listenerRef = WeakReference<InputListener>(mapInputListener)
+        mapInputListenerRef = listenerRef
+        mapView.mapWindow.map.addInputListener(listenerRef)
+
+        val point = Point(56.634828, 47.876786)
+        mapView.mapWindow.map.move(
+            CameraPosition(point, 15f, 0f, 0f),
+            Animation(Animation.Type.SMOOTH, 1.5f),
+            null
+        )
+    }
+
+    private fun activateUserLocation() {
+        try {
+            val mapKit = MapKitFactory.getInstance()
+            val userLocationLayer = mapKit.createUserLocationLayer(mapView.mapWindow)
+            userLocationLayer.isVisible = true
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        MapKitFactory.getInstance().onStart()
+        mapView.onStart()
+    }
+
+    override fun onStop() {
+        try {
+            mapInputListenerRef?.let { mapView.mapWindow?.map?.removeInputListener(it) }
+            searchSession?.cancel()
+
+            // ИСПРАВЛЕНО: Сбрасываем сессию подсказок методом reset()
+            suggestSession?.reset()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        mapView.onStop()
+        MapKitFactory.getInstance().onStop()
+        super.onStop()
+    }
+
+
+    private fun buttonAdd(){
+        binding.btnAdd.setOnClickListener {
+            val city = binding.mapText.text.toString().trim()
+            val podiezd = binding.mapPodiezd.text.toString().trim()
+            val etazh = binding.mapEtazh.text.toString().trim()
+            val kvartira = binding.mapKvartira.text.toString().trim()
+            val podiezdInt = podiezd.toIntOrNull() ?: 0
+            val etazhInt = etazh.toIntOrNull() ?: 0
+            val kvartiraInt = kvartira.toIntOrNull() ?: 0
+
+            if (city.isEmpty() || city == "Загрузка адреса..." || city == "Адрес не найден") {
+                Toast.makeText(this, "Выберите корректный адрес на карте", Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+
+            val databaseReference = FirebaseDatabase.getInstance().getReference("user_addresses")
+
+            val addressId = databaseReference.push().key
+
+            if(addressId != null){
+                val newAddress = Address(addressId, city, podiezdInt, etazhInt, kvartiraInt)
+                databaseReference.child(addressId).setValue(newAddress).addOnSuccessListener {
+
+                    // 1. Принудительно отменяем сессию поиска перед закрытием экрана
+                    searchSession?.cancel()
+                    searchSession = null
+
+                    // 2. Очищаем маркер, если он есть
+                    selectionPlacemark = null
+
+                    val intent = Intent(this, AddressActivity::class.java)
+                    startActivity(intent)
+                    finish()
+                }
+                    .addOnFailureListener { error ->
+                        Toast.makeText(this, "Ошибка Firebase: ${error.message}", Toast.LENGTH_LONG).show()
+                    }
+            }
+        }
+    }
+
+    // Вынесите создание вашей красной точки в отдельный метод, чтобы вызывать его и при тапе по карте, и при выборе саджеста
+    private fun drawMarkerAtPoint(point: Point) {
+        selectionPlacemark?.let { try { mapView.mapWindow.map.mapObjects.remove(it) } catch(e: Exception){} }
+        val bitmap = android.graphics.Bitmap.createBitmap(40, 40, android.graphics.Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bitmap)
+        val paint = android.graphics.Paint().apply { color = android.graphics.Color.RED; isAntiAlias = true }
+        canvas.drawCircle(20f, 20f, 15f, paint)
+        paint.color = android.graphics.Color.WHITE; paint.style = android.graphics.Paint.Style.STROKE; paint.strokeWidth = 4f
+        canvas.drawCircle(20f, 20f, 15f, paint)
+
+        selectionPlacemark = mapView.mapWindow.map.mapObjects.addPlacemark().apply {
+            geometry = point
+            setIcon(com.yandex.runtime.image.ImageProvider.fromBitmap(bitmap))
+        }
+    }
+}
